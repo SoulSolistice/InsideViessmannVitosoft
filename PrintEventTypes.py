@@ -4,13 +4,55 @@ from xml.etree import ElementTree as etree
 # This path needs to be adjusted to point to a directory for all XML files
 DATAPATH = "../data/"
 
+def _localname(tag):
+	# Strip any XML namespace from a tag: '{ns}Name' -> 'Name'
+	if isinstance(tag, str) and tag.startswith('{'):
+		return tag.split('}', 1)[1]
+	return tag
+
 textList = {}
 def parse_Textresource(lang):
-	root = etree.parse(DATAPATH + "Textresource_%s.xml" % lang).getroot()
-	for rootNodes in root:
-		if 'TextResources' in rootNodes.tag:
-			for textNode in rootNodes:
-				textList[textNode.attrib['Label']] = textNode.attrib['Value']
+	# Newer Vitosoft exports ship a single 'Textresource.xml' containing ALL
+	# languages, discriminated by a 'CultureId' attribute, instead of one
+	# 'Textresource_<lang>.xml' per language. Support the new single-file
+	# layout and fall back to the legacy per-language file.
+	import os
+	singleFile = DATAPATH + "Textresource.xml"
+	legacyFile = DATAPATH + "Textresource_%s.xml" % lang
+	path = singleFile if os.path.exists(singleFile) else legacyFile
+	root = etree.parse(path).getroot()
+
+	# Resolve the requested language name (e.g. 'de') to its CultureId by
+	# reading the <Cultures> table. Legacy single-language files have no
+	# <Cultures> section, in which case we do not filter.
+	cultureId = None
+	hasCultures = False
+	for section in root:
+		if _localname(section.tag) == 'Cultures':
+			hasCultures = True
+			for culture in section:
+				if culture.attrib.get('Name') == lang:
+					cultureId = culture.attrib.get('Id')
+			break
+	if hasCultures and cultureId is None:
+		available = []
+		for section in root:
+			if _localname(section.tag) == 'Cultures':
+				available = [c.attrib.get('Name') for c in section]
+		raise ValueError("Language %r not found in %s. Available: %s"
+						 % (lang, path, ', '.join(filter(None, available))))
+
+	for section in root:
+		if _localname(section.tag) != 'TextResources':
+			continue
+		for textNode in section:
+			attrib = textNode.attrib
+			if 'Label' not in attrib or 'Value' not in attrib:
+				continue
+			# In the consolidated file keep only rows for the requested culture.
+			if cultureId is not None and attrib.get('CultureId') not in (None, cultureId):
+				continue
+			textList[attrib['Label']] = attrib['Value']
 
 def parse_ecnEventType():
 	root = etree.parse(DATAPATH + "ecnEventType.xml").getroot()
@@ -87,9 +129,25 @@ def parse_ecnEventType():
 					border += 'Sec2Hour(/3600.0)'
 				elif event['Conversion'] == 'Sec2Minute':
 					border += 'Sec2Minute(/60.0)'
+				elif event['Conversion'] == 'Sec2Day':
+					border += 'Sec2Day(/86400.0)'
+				elif event['Conversion'] == 'Sec2Week':
+					border += 'Sec2Week(/604800.0)'
+				elif event['Conversion'] == 'Sec2Month':
+					border += 'NOTIMPL: %s' % event['Conversion']
 				elif event['Conversion'] == 'Time53':
 					border += 'Time53(hh:mm)'
+				elif event['Conversion'] == 'UTCDiff2Hour':
+					border += 'NOTIMPL: %s' % event['Conversion']
+				elif event['Conversion'] == 'UTCDiff2Day':
+					border += 'NOTIMPL: %s' % event['Conversion']
 				elif event['Conversion'] == 'UTCDiff2Month':
+					border += 'NOTIMPL: %s' % event['Conversion']
+				elif event['Conversion'] == 'Convert4BytesToFloat':
+					border += 'Convert4BytesToFloat(IEEE754)'
+				elif event['Conversion'] == 'Steuerzeichen':
+					border += 'NOTIMPL: %s' % event['Conversion']
+				elif event['Conversion'] == 'ImpulszaehlerV300FA2':
 					border += 'NOTIMPL: %s' % event['Conversion']
 				elif event['Conversion'] == 'Vitocom300SGEinrichtenKanalLON':
 					border += 'NOTIMPL: %s' % event['Conversion']

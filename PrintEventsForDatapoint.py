@@ -14,22 +14,79 @@ DATAPATH = "../data/"
 
 MAX_STR_LENGTH = 1000 # certain strings (e.g. conditions) can be very long. This shortens them. 1000 matches "print everything"
 
+def _localname(tag):
+	# Strip any XML namespace from a tag: '{ns}Name' -> 'Name'
+	if isinstance(tag, str) and tag.startswith('{'):
+		return tag.split('}', 1)[1]
+	return tag
+
+def _strip_namespaces(root):
+	# Remove XML namespaces in-place so element tags become bare local names
+	# ('{urn:...}ecnEventType' -> 'ecnEventType'). This lets the rest of the
+	# parser match plain tag names regardless of the namespaces Vitosoft emits.
+	for elem in root.iter():
+		if isinstance(elem.tag, str) and elem.tag.startswith('{'):
+			elem.tag = elem.tag.split('}', 1)[1]
+	return root
+
 textList = {}
 def parse_Textresource(lang):
-	root = etree.parse(DATAPATH + "Textresource_%s.xml" % lang).getroot()
-	for rootNodes in root:
-		if 'TextResources' in rootNodes.tag:
-			for textNode in rootNodes:
-				textList[textNode.attrib['Label']] = textNode.attrib['Value'].replace('##ecnnewline##','\\n').replace('##ecntab##','\\t')
+	# Newer Vitosoft exports ship a single 'Textresource.xml' containing ALL
+	# languages, discriminated by a 'CultureId' attribute, instead of one
+	# 'Textresource_<lang>.xml' per language. Support the new single-file
+	# layout and fall back to the legacy per-language file.
+	import os
+	singleFile = DATAPATH + "Textresource.xml"
+	legacyFile = DATAPATH + "Textresource_%s.xml" % lang
+	path = singleFile if os.path.exists(singleFile) else legacyFile
+	root = etree.parse(path).getroot()
+
+	# Resolve the requested language name (e.g. 'de') to its CultureId by
+	# reading the <Cultures> table. Legacy single-language files have no
+	# <Cultures> section, in which case we do not filter.
+	cultureId = None
+	hasCultures = False
+	for section in root:
+		if _localname(section.tag) == 'Cultures':
+			hasCultures = True
+			for culture in section:
+				if culture.attrib.get('Name') == lang:
+					cultureId = culture.attrib.get('Id')
+			break
+	if hasCultures and cultureId is None:
+		available = []
+		for section in root:
+			if _localname(section.tag) == 'Cultures':
+				available = [c.attrib.get('Name') for c in section]
+		raise ValueError("Language %r not found in %s. Available: %s"
+						 % (lang, path, ', '.join(filter(None, available))))
+
+	for section in root:
+		if _localname(section.tag) != 'TextResources':
+			continue
+		for textNode in section:
+			attrib = textNode.attrib
+			if 'Label' not in attrib or 'Value' not in attrib:
+				continue
+			# In the consolidated file keep only rows for the requested culture.
+			if cultureId is not None and attrib.get('CultureId') not in (None, cultureId):
+				continue
+			textList[attrib['Label']] = attrib['Value'].replace('##ecnnewline##','\\n').replace('##ecntab##','\\t')
 
 def translate(node,key):
 	if key in node and node[key] and node[key].startswith('@@'):
 		if node[key][2:] in textList and len(node[key][2:]):
 			node[key] = textList[node[key][2:]]
 
-def parse_node(root,nodeName):
+def parse_node(dataRoots,nodeName):
+	# 'dataRoots' is the list of <ECNDataSet> diffgram elements; the rows we
+	# want are their direct children. (Originally this searched the entire
+	# document with './/', which also reached other datasets and the schema.)
 	elements = []
-	for xmlEvent in root.findall(".//" + nodeName):
+	matches = []
+	for dataRoot in dataRoots:
+		matches.extend(dataRoot.findall(nodeName))
+	for xmlEvent in matches:
 		dp = {}
 		for cell in xmlEvent:
 			if cell.tag in ['Description','URL','DefaultValue','Filtercriterion','Reportingcriterion','Priority']:
@@ -136,13 +193,32 @@ def eventTypeDescr(eventID):
 
 def parse_DPDefinitions(selectedDatapointTypeAddress):
 	classes = set()
-	root = etree.fromstring(re.sub(' xmlns="[^"]+"', '', open(DATAPATH + "DPDefinitions.xml",'r').read()))
-	for xmlEvent in root.find("ECNDataSet/{urn:schemas-microsoft-com:xml-diffgram-v1}diffgram/ECNDataSet"):
-		classes.add(xmlEvent.tag)
+	# Parse the file directly so ElementTree honours the XML declaration's
+	# encoding (newer exports are UTF-8, older ones UTF-16) and so we avoid
+	# reading a ~200 MB file into a string just to run a regex over it.
+	tree = etree.parse(DATAPATH + "DPDefinitions.xml")
+	root = _strip_namespaces(tree.getroot())
+
+	# The container ('ImportExportDataHolder') holds one or more datasets, each
+	# serialised as an inline <xs:schema> followed by a <diffgram>. We only want
+	# the rows of the 'ECNDataSet' dataset and must ignore any others (e.g.
+	# 'DocumentServerDataSet'). Collect every ECNDataSet payload root.
+	dataRoots = []
+	for diffgram in root.iter('diffgram'):
+		for child in diffgram:
+			if child.tag == 'ECNDataSet':
+				dataRoots.append(child)
+	if not dataRoots:
+		raise RuntimeError("No <ECNDataSet> diffgram found in DPDefinitions.xml - "
+						   "the export structure may have changed.")
+
+	for dataRoot in dataRoots:
+		for xmlEvent in dataRoot:
+			classes.add(xmlEvent.tag)
 
 	nodeListe = {}
 	for cl in classes:
-		nodes = parse_node(root,cl)
+		nodes = parse_node(dataRoots,cl)
 		if True:
 			if cl == 'ecnEventValueType':
 				for dd in nodes:
@@ -244,17 +320,21 @@ def parse_DPDefinitions(selectedDatapointTypeAddress):
 				else:
 					name = '"%s"' % name
 				#name += ' (%d)' % (eventTypeId)
-				eventValue = nodeListe['ecnEventValueType'][int(dispCond['EventTypeValueCondition'])]
-				if 'EnumReplaceValue' in eventValue:
-					val = '"%s"' % eventValue['EnumReplaceValue']
-				elif 'EnumAddressValue' in eventValue:
-					val = '"%s"' % eventValue['EnumAddressValue']
+				condInt = int(dispCond['Condition'])
+				# Per VitosoftXML.md: for Condition >= 2 (>, >=, <, <=) the comparison
+				# value is the literal 'ConditionValue'; only Equal/NotEqual (0/1)
+				# compare against the 'EventTypeValueCondition' enum value.
+				if condInt >= 2:
+					val = '%s' % dispCond.get('ConditionValue', '?')
 				else:
-					val = '%s' % eventValue
-				if 'EqualCondition' in dispCond:
-					ll.append(name + '=' + val)
-				else:
-					ll.append(name + condDict[int(dispCond['Condition'])] + val)
+					eventValue = nodeListe['ecnEventValueType'][int(dispCond['EventTypeValueCondition'])]
+					if 'EnumReplaceValue' in eventValue:
+						val = '"%s"' % eventValue['EnumReplaceValue']
+					elif 'EnumAddressValue' in eventValue:
+						val = '"%s"' % eventValue['EnumAddressValue']
+					else:
+						val = '"%s"' % eventValue.get('Name', '?')
+				ll.append(name + condDict[condInt] + val)
 			groupCond += (' ' + operDict[displayConditionGroup['Type']] + ' ').join(ll)
 		if groupCond:
 			return ' HIDDEN:(%s)' % groupCond

@@ -10,11 +10,22 @@ pp = pprint.PrettyPrinter(width=200,compact=True)
 # This path needs to be adjusted to point to a directory for all XML files
 DATAPATH = "../data/"
 
+def _strip_namespaces(root):
+	# Remove XML namespaces in-place so element tags become bare local names
+	# ('{urn:...}ControllerType' -> 'ControllerType'). Harmless on files that
+	# carry no namespace; keeps the tag comparisons below working if a future
+	# Vitosoft export wraps this file in a namespace.
+	for elem in root.iter():
+		if isinstance(elem.tag, str) and elem.tag.startswith('{'):
+			elem.tag = elem.tag.split('}', 1)[1]
+	return root
+
 def print_allDataPoints():
 	# print supported Optolink systems (at least remove all MBus, LON, etc ones)
 	evnDataPointTypes = {}
 	def parse_ecnDataPointType():
-		for nodes in etree.parse(DATAPATH + "ecnDataPointType.xml").getroot():
+		root = _strip_namespaces(etree.parse(DATAPATH + "ecnDataPointType.xml").getroot())
+		for nodes in root:
 			dataPointType = {}
 			for cell in nodes:
 				value = cell.text
