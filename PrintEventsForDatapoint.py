@@ -78,6 +78,35 @@ def translate(node,key):
 		if node[key][2:] in textList and len(node[key][2:]):
 			node[key] = textList[node[key][2:]]
 
+def _readable(label):
+	# Fallback for labels that translate() could not resolve. The 2026 export
+	# references display names via '@@viessmann.<type>.name.<TECH>' (and similar)
+	# but ships none of those strings in Textresource.xml, so the labels arrive
+	# unresolved. Recover the underlying technical name instead of printing the
+	# raw '@@...' label. Resolved (already-translated) values pass through.
+	if not isinstance(label, str) or not label.startswith('@@'):
+		return label
+	s = label[2:]
+	if '.name.' in s:                       # ...eventtype.name.Outside_Temp -> Outside_Temp
+		return s.split('.name.', 1)[1]
+	parts = s.split('.')                    # ...eventvaluetype.K52_KonfiWeiche~0 -> K52_KonfiWeiche~0
+	if len(parts) >= 3 and parts[0] in ('viessmann', 'econtrolnet'):
+		return '.'.join(parts[2:])
+	return s
+
+def _friendly(label):
+	# Friendly (human) name for an entity. Strategy: if 'label' resolved to a
+	# real translation (anything not still starting with '@@'), use it verbatim.
+	# Otherwise derive one from the technical identifier by turning '_' into
+	# spaces. This is a deliberately light touch -- it cleans snake_case names
+	# (Outside_Temp -> "Outside Temp") but leaves Viessmann's camelCase/coding
+	# compounds (K00_..., ...A1M1) largely as-is; a real translation source is
+	# still preferable where clean labels matter. The technical id is always
+	# carried separately (see the bracketed [address]/[id] in the output).
+	if isinstance(label, str) and label and not label.startswith('@@'):
+		return label
+	return _readable(label).replace('_', ' ').strip()
+
 def parse_node(dataRoots,nodeName):
 	# 'dataRoots' is the list of <ECNDataSet> diffgram elements; the rows we
 	# want are their direct children. (Originally this searched the entire
@@ -314,7 +343,7 @@ def parse_DPDefinitions(selectedDatapointTypeAddress):
 				eventTypeId = int(dispCond['EventTypeIdCondition'])
 				usedConditionEventTypeIds.add(eventTypeId)
 				eventType = nodeListe['ecnEventType'][eventTypeId]
-				name = eventType['Name'].strip()
+				name = _readable(eventType['Name']).strip()
 				if name in shortName:
 					name = shortName[name]
 				else:
@@ -329,11 +358,11 @@ def parse_DPDefinitions(selectedDatapointTypeAddress):
 				else:
 					eventValue = nodeListe['ecnEventValueType'][int(dispCond['EventTypeValueCondition'])]
 					if 'EnumReplaceValue' in eventValue:
-						val = '"%s"' % eventValue['EnumReplaceValue']
+						val = '"%s"' % _readable(eventValue['EnumReplaceValue'])
 					elif 'EnumAddressValue' in eventValue:
-						val = '"%s"' % eventValue['EnumAddressValue']
+						val = '"%s"' % _readable(eventValue['EnumAddressValue'])
 					else:
-						val = '"%s"' % eventValue.get('Name', '?')
+						val = '"%s"' % _readable(eventValue.get('Name', '?'))
 				ll.append(name + condDict[condInt] + val)
 			groupCond += (' ' + operDict[displayConditionGroup['Type']] + ' ').join(ll)
 		if groupCond:
@@ -481,67 +510,72 @@ def parse_DPDefinitions(selectedDatapointTypeAddress):
 				else:
 					usedGroups[0] = [eventType]
 
-	eventTypeGroups = {}
-	for eventTypeGroupId,eventTypeGroup in nodeListe['ecnEventTypeGroup'].items():
-		if eventTypeGroup['DataPointTypeId'] == datapointTypeId:
-			del eventTypeGroup['DataPointTypeId']
-			del eventTypeGroup['DeviceTypeId']
-			eventTypeGroups[eventTypeGroupId] = eventTypeGroup
-	sortedEventTypeGroups = sorted(eventTypeGroups,key=lambda x:eventTypeGroups[x]['OrderIndex'])
-	for eventTypeGroupId in sortedEventTypeGroups:
-		eventTypeGroup = eventTypeGroups[eventTypeGroupId]
-		if 'ParentId' not in eventTypeGroup:
-			eventTypeGroupName = eventTypeGroup['Name']
-			if eventTypeGroupName in textList and len(eventTypeGroupName):
-				eventTypeGroupName= textList[eventTypeGroupName]
-			if eventTypeGroupName.startswith('ecnsys'):
-				continue
-			if eventTypeGroupName == 'Feuerungsautomat':
-				break
-			# find all children of this parent
-			eventTypeGroupChildren = {}
-			for eventTypeGroupChildId in sortedEventTypeGroups:
-				eventTypeGroupChild = eventTypeGroups[eventTypeGroupChildId]
-				if 'ParentId' not in eventTypeGroupChild:
-					continue
-				if eventTypeGroupChild['ParentId'] == eventTypeGroupId:
-					del eventTypeGroupChild['ParentId']
-					eventTypeGroupChildren[eventTypeGroupChildId] = eventTypeGroupChild
-			if len(eventTypeGroupChildren): # no children, parent is not needed
-				def groupStr(groupId,groupName):
-					result = groupName.strip()
-					result += ' (%d)' % groupId
-					condStr = getCondStr(groupId)
-					if len(condStr)>MAX_STR_LENGTH:
-						condStr = condStr[:MAX_STR_LENGTH]+'…)'
-					result += condStr
-					return result
-				print()
-				print("# " + groupStr(eventTypeGroupId,eventTypeGroupName))
-				for eventTypeGroupChildId in sorted(eventTypeGroupChildren,key=lambda x:eventTypeGroupChildren[x]['OrderIndex']):
-					eventTypeGroupChild = eventTypeGroupChildren[eventTypeGroupChildId]
-					eventTypeGroupChildName = eventTypeGroupChild['Name']
-					if eventTypeGroupChildName in textList and len(eventTypeGroupChildName):
-						eventTypeGroupChildName= textList[eventTypeGroupChildName]
-					if eventTypeGroupChildId in usedGroups and len(usedGroups[eventTypeGroupChildId]):
-						print("- " + groupStr(eventTypeGroupChildId,eventTypeGroupChildName))
-						if eventTypeGroupChildId in usedGroups:
-							for kk in sorted(usedGroups[eventTypeGroupChildId]):
-								eventType = usedGroups[eventTypeGroupChildId][kk]
-								def eventTypeStr(eventType):
-									result = eventType['Name'].strip()
-									result += ' (%d)' % eventType['Id']
-									valStr = '%s' % eventType['_VALUE_']
-									if len(valStr)>MAX_STR_LENGTH:
-										valStr = valStr[:MAX_STR_LENGTH]+'…}'
-									#result += ' ' + valStr
-									result += ' [' + eventTypeDescr(eventType['Address']) + ']'
-									condStr = getCondStr(eventType['Id'],'EventTypeIdDest')
-									if len(condStr)>MAX_STR_LENGTH:
-										condStr = condStr[:MAX_STR_LENGTH]+'…)'
-									result += condStr
-									return result
-								print('    - ' + eventTypeStr(eventType))
+	# --- Print the datapoint's event groups as a tree -----------------------
+	# Data extraction above is complete; everything below is presentation. The
+	# 2026 export nests functional ("@@...") groups beneath top-level
+	# "ecnsys..." UI-section groups, and some events sit directly in a group, so
+	# the old fixed two-level printer (which also skipped every "ecnsys" parent)
+	# emitted nothing. Print the real hierarchy at its natural depth and show any
+	# group that itself, or transitively, carries events.
+	groups = {}
+	for gid, g in nodeListe['ecnEventTypeGroup'].items():
+		if g.get('DataPointTypeId') == datapointTypeId:
+			groups[gid] = g
+
+	childrenOf = {}
+	topLevel = []
+	for gid, g in groups.items():
+		pid = g.get('ParentId')
+		if pid is None or pid not in groups:
+			topLevel.append(gid)
+		else:
+			childrenOf.setdefault(pid, []).append(gid)
+
+	def groupHasEvents(gid, seen=None):
+		if seen is None:
+			seen = set()
+		if gid in seen:
+			return False
+		seen.add(gid)
+		if gid in usedGroups and len(usedGroups[gid]):
+			return True
+		return any(groupHasEvents(c, seen) for c in childrenOf.get(gid, []))
+
+	def groupName(g):
+		n = g.get('Name', '')
+		if n in textList and len(n):
+			n = textList[n]
+		return _friendly(n)
+
+	def orderOf(gid):
+		return groups[gid].get('OrderIndex', 0)
+
+	def clip(s):
+		if len(s) > MAX_STR_LENGTH:
+			return s[:MAX_STR_LENGTH] + '\u2026)'
+		return s
+
+	def printGroup(gid, depth):
+		g = groups[gid]
+		indent = '    ' * depth
+		bullet = '# ' if depth == 0 else '- '
+		techId = g.get('Address') or _readable(g.get('Name', ''))
+		print()
+		print('%s%s%s (%d) [%s]%s' % (indent, bullet, groupName(g).strip(), gid, techId, clip(getCondStr(gid))))
+		if gid in usedGroups and len(usedGroups[gid]):
+			for kk in sorted(usedGroups[gid]):
+				ev = usedGroups[gid][kk]
+				line = _friendly(ev['Name']).strip() + ' (%d)' % ev['Id']
+				line += ' [' + eventTypeDescr(ev['Address']) + ']'
+				line += clip(getCondStr(ev['Id'], 'EventTypeIdDest'))
+				print('%s    - %s' % (indent, line))
+		for cid in sorted(childrenOf.get(gid, []), key=orderOf):
+			if groupHasEvents(cid):
+				printGroup(cid, depth + 1)
+
+	for gid in sorted(topLevel, key=orderOf):
+		if groupHasEvents(gid):
+			printGroup(gid, 0)
 
 		if False:
 			print()
